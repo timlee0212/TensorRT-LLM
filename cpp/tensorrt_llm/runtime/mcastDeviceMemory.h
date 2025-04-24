@@ -25,7 +25,16 @@
 
 namespace tensorrt_llm::runtime
 {
-//! Add Doxygen comment for the class
+
+//! \brief A class that manages multicast device memory for efficient communication between GPUs.
+//!
+//! This class uses IPC-based allocation if mnNvlink is true, otherwise it uses fabric allocation.
+//! The fabric allocation can also be used for single-node/intra-node-only communication, but the machine
+//! must properly configure IMEX services. See:
+//! https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/gettingstarted.html
+//!
+//! The class manages both unicast pointers (one per rank) and a single multicast pointer,
+//! along with signal pads used for synchronization between devices.
 class McastDeviceMemory
 {
 public:
@@ -33,26 +42,21 @@ public:
     McastDeviceMemory(McastDeviceMemory const&) = delete;
     McastDeviceMemory& operator=(McastDeviceMemory const&) = delete;
 
-    // // Move construction
-    // McastDeviceMemory(McastDeviceMemory&&) noexcept;
-    // McastDeviceMemory& operator=(McastDeviceMemory&&) noexcept;
-
-    //! Add Doxygen comment
     McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink);
 
-    //! Add Doxygen comment
+    //! Get the raw array of signal pad pointers to all ranks (including self)
     void** getSignalPadPtrsDev()
     {
         return reinterpret_cast<void**>(mSignalPadsDev.data());
     }
 
-    //! Add Doxygen comment
+    //! Get the raw array of unicast pointers to all ranks (including self)
     void** getBufferPtrsDev()
     {
         return reinterpret_cast<void**>(mUcPtrs.data());
     }
 
-    //! Add Doxygen comment
+    //! Get the raw unicast pointer to a given rank
     void* getUnicastPtr(uint32_t rank)
     {
         auto* data_ptr = reinterpret_cast<void*>(mUcPtrs[rank]);
@@ -60,7 +64,7 @@ public:
         return data_ptr;
     }
 
-    //! Add Doxygen comment
+    //! Get the raw multicast pointer
     void* getMulticastPtr()
     {
         auto* data_ptr = reinterpret_cast<void*>(mMcPtr);
@@ -68,13 +72,11 @@ public:
         return data_ptr;
     }
 
-    //! Add Doxygen comment
     [[nodiscard]] size_t getRank() const
     {
         return mGroupRank;
     }
 
-    //! Add Doxygen comment
     [[nodiscard]] size_t getWorldSize() const
     {
         return mGroupSize;

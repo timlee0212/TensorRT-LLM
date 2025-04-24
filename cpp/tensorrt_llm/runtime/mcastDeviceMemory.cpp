@@ -49,7 +49,7 @@ inline size_t roundUp(size_t val, size_t gran)
     return (val + gran - 1) & ~(gran - 1);
 }
 } // namespace
-#if ENABLE_MULTI_DEVICE
+
 McastDeviceMemory::McastDeviceMemory(
     size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink)
     : mIsMNNvlink(mnNvlink)
@@ -228,5 +228,5 @@ void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
     mUcPtrs = mNvlsHandle->ipc_uc_vas;
     mUcHandles = mNvlsHandle->ipc_uc_handles;
 }
-#endif
+
 } // namespace tensorrt_llm::runtime
