@@ -872,7 +872,6 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor const& residual, torch::T
 
 void mcastGPUBarrier(at::Tensor& comm_buffer, int64_t timeout_ms)
 {
-
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
     tensorrt_llm::kernels::mcastGPUBarrier(reinterpret_cast<uint32_t**>(mcast_mem->getSignalPadPtrsDev()),

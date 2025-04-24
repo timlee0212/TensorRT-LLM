@@ -469,6 +469,7 @@ void initBindings(pybind11::module_& m)
             tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
         },
         "Delay kernel launch on the default stream");
+
     py::class_<McastGPUBuffer>(m, "McastGPUBuffer")
         .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
         .def("get_uc_buffer", &McastGPUBuffer::getUCBuffer)

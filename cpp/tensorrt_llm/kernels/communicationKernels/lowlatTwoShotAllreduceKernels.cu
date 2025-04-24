@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -127,7 +127,7 @@ static __global__ void barrier_kernel(uint32_t** signal_pads, int channel, int r
         if (!put_success)
         {
             printf(
-                "[FATAL] CUDASymmetricMemory::barrier: rank %d failed to send signal "
+                "[mcastGPUBarrier] rank %d failed to send signal "
                 "to rank %d on channel %d after %lu microseconds\n",
                 rank, target_rank, channel, timeout_ms);
             asm volatile("trap;");
@@ -137,7 +137,7 @@ static __global__ void barrier_kernel(uint32_t** signal_pads, int channel, int r
         if (!wait_success)
         {
             printf(
-                "[FATAL] CUDASymmetricMemory::barrier: rank %d failed to receive signal "
+                "[mcastGPUBarrier] rank %d failed to receive signal "
                 "from rank %d on channel %d after %lu microseconds\n",
                 rank, target_rank, channel, timeout_ms);
             asm volatile("trap;");
@@ -156,9 +156,9 @@ void mcastGPUBarrier(uint32_t** signal_pads_dev_, int rank, int world_size, int8
 }
 
 template <int WORLD_SIZE, typename T>
-__global__ void two_shot_all_reduce_kernel(T* output_ptr, T* shard_ptr, T** input_ptrs, T* mcast_ptr,
-    size_t input_offset, size_t clear_offset, int num_tokens, int buffer_M, int token_dim, uint32_t** signal_pads,
-    int rank, bool wait_for_results)
+__global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_ptrs, T* mcast_ptr, size_t input_offset,
+    size_t clear_offset, int num_tokens, int buffer_M, int token_dim, uint32_t** signal_pads, int rank,
+    bool wait_for_results)
 {
 
     int elt = blockIdx.y * blockDim.x + threadIdx.x;
@@ -236,7 +236,7 @@ __global__ void two_shot_all_reduce_kernel(T* output_ptr, T* shard_ptr, T** inpu
 }
 
 #define LAUNCH_ALL_REDUCE_KERNEL(WORLD_SIZE, T)                                                                        \
-    cudaLaunchKernelEx(&config, &two_shot_all_reduce_kernel<WORLD_SIZE, T>, reinterpret_cast<T*>(output.data_ptr()),   \
+    cudaLaunchKernelEx(&config, &twoshot_allreduce_kernel<WORLD_SIZE, T>, reinterpret_cast<T*>(output.data_ptr()),     \
         reinterpret_cast<T*>(input.data_ptr()), reinterpret_cast<T**>(mcast_mem->getBufferPtrsDev()),                  \
         (T*) mcast_mem->getMulticastPtr(), comm_buffer.storage_offset() + buffer_offset,                               \
         comm_buffer.storage_offset() + clear_offset, num_tokens, buffer_M, token_dim,                                  \
@@ -285,7 +285,7 @@ at::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mc
         case 16: LAUNCH_ALL_REDUCE_KERNEL(16, float); break;
         case 32: LAUNCH_ALL_REDUCE_KERNEL(32, float); break;
         case 64: LAUNCH_ALL_REDUCE_KERNEL(64, float); break;
-        default: assert(false);
+        default: TORCH_CHECK(false, "[TwoShot AllReduce]Unsupported world_size:", world_size);
         }
     }
     else if (input.scalar_type() == torch::kBFloat16)
@@ -298,8 +298,12 @@ at::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mc
         case 16: LAUNCH_ALL_REDUCE_KERNEL(16, __nv_bfloat16); break;
         case 32: LAUNCH_ALL_REDUCE_KERNEL(32, __nv_bfloat16); break;
         case 64: LAUNCH_ALL_REDUCE_KERNEL(64, __nv_bfloat16); break;
-        default: assert(false);
+        default: TORCH_CHECK(false, "[TwoShot AllReduce]Unsupported world_size:", world_size);
         }
+    }
+    else
+    {
+        TORCH_CHECK(false, "[TwoShot AllReduce]Unsupported input type:", input.scalar_type());
     }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -625,7 +629,8 @@ void _rmsnorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor normed_o
     }
     else
     {
-        assert(false);
+        TORCH_CHECK(false, "[TwoShot AllReduce]Unsupported combination of dtypes: input:", input.scalar_type(),
+            "normed_output:", normed_output.scalar_type(), "gamma:", gamma.scalar_type());
     }
 }
 } // namespace
@@ -646,5 +651,4 @@ void twoShotRMSNorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor no
     default: TORCH_CHECK(false, "Unsupported dimension for rmsnorm: ", dim);
     }
 }
-
 }; // namespace tensorrt_llm::kernels
