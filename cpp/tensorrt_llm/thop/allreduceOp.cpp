@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/communicationKernels/lowlatTwoShotAllreduceKernels.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
@@ -869,10 +870,36 @@ std::vector<torch::Tensor> moe_allreduce(torch::Tensor residual, torch::Tensor n
     return {norm_out, residual_out};
 }
 
+void mcastGPUBarrier(at::Tensor& comm_buffer, int64_t timeout_ms)
+{
+
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
+    tensorrt_llm::kernels::mcastGPUBarrier(reinterpret_cast<uint32_t**>(mcast_mem->getSignalPadPtrsDev()),
+        mcast_mem->getRank(), mcast_mem->getWorldSize(), comm_buffer.device().index(), static_cast<size_t>(timeout_ms));
+}
+
+at::Tensor lowlatTwoShotAllReduce(at::Tensor output, at::Tensor input, at::Tensor comm_buffer, int64_t buffer_offset,
+    int64_t clear_offset, bool wait_for_results)
+{
+    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
+    return tensorrt_llm::kernels::twoShotAllReduceDispatch(
+        mcast_mem, output, input, comm_buffer, buffer_offset, clear_offset, wait_for_results);
+}
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("mcast_gpu_barrier(Tensor(comm_buf!) comm_buffer, int timeout_ms) -> ()");
+    m.def(
+        "lowlat_twoshot_allreduce(Tensor(output!) output, Tensor(input!) input, Tensor(comm_buf!) comm_buffer, int "
+        "buffer_offset, int clear_offset, bool wait_for_result) "
+        "-> Tensor");
+    m.def(
+        "lowlat_twoshot_rmsnorm(int rank, Tensor prenorm_output, Tensor normed_output,Tensor input, Tensor gamma, "
+        "float epsilon, "
+        "Tensor residual) -> ()");
     m.def(
         "allreduce(Tensor input, Tensor? residual, Tensor? norm_weight, Tensor? scale, Tensor? bias, Tensor? "
         "workspace, int[] group, int "
@@ -887,6 +914,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("mcast_gpu_barrier", &torch_ext::mcastGPUBarrier);
+    m.impl("lowlat_twoshot_allreduce", &torch_ext::lowlatTwoShotAllReduce);
+    m.impl("lowlat_twoshot_rmsnorm", &tensorrt_llm::kernels::twoShotRMSNorm);
     m.impl("allreduce", &torch_ext::allreduce);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
 }

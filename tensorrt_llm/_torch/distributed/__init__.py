@@ -1,13 +1,15 @@
 from .communicator import Distributed, MPIDist, PPComm, TorchDist
 from .ops import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                  AllReduceStrategy, DeepseekAllReduce, allgather,
-                  reducescatter, userbuffers_allreduce_finalize)
+                  AllReduceStrategy, DeepseekAllReduce,
+                  LowLatencyTwoShotAllReduce, allgather, reducescatter,
+                  userbuffers_allreduce_finalize)
 
 __all__ = [
     "allgather",
     "allreduce",
     "reducescatter",
     "userbuffers_allreduce_finalize",
+    "LowLatencyTwoShotAllReduce",
     "AllReduce",
     "AllReduceParams",
     "AllReduceFusionOp",
