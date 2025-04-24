@@ -43,6 +43,7 @@ set(SRCS
     ipcUtils.cpp
     ipcSocket.cpp
     ipcNvlsMemory.cpp
+    mcastDeviceMemory.cpp
     memoryCounters.cpp
     ncclCommunicator.cpp
     promptTuningParams.cpp
