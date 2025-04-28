@@ -601,7 +601,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.next_layer_layernorm: RMSNorm = None
         self.use_lowlat_allreduce = (
             os.environ.get("TRTLLM_LLAR_ENABLED", "0") == "1"
-            and not (mapping.has_pp() or mapping.has_cp())
+            and (not (mapping.has_pp() or mapping.has_cp()))
             and config.torch_dtype in [torch.bfloat16, torch.float32]
         )
 
@@ -735,7 +735,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         else:
             # No fusion
             # We need to add twoshot allreduce here to avoid modifying MLA logic
-            if iter_use_ll_twoshot:  # Equal to disable attention allreduce
+            if iter_use_ll_twoshot and not self.disable_attn_allreduce:  # Equal to disable attention allreduce
                 hidden_states = self.lowlat_allreduce(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
@@ -823,7 +823,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 )
         else:
             # Disable mlp's allreduce if use ll twoshot
-            if iter_use_ll_twoshot:
+            if iter_use_ll_twoshot and not (self.mapping.tp_size == 1 or self.enable_attention_dp):
                 hidden_states = self.lowlat_allreduce(hidden_states)
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(hidden_states, residual)
@@ -916,8 +916,15 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                         eps=self.post_attention_layernorm.variance_epsilon,
                     ),
                 )
+            else:
+                hidden_states, residual = self.deepseek_allreduce(
+                    hidden_states,
+                    [residual, self.post_attention_layernorm.weight],
+                    self.post_attention_layernorm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                )
         else:
-            if iter_use_ll_twoshot:
+            if iter_use_ll_twoshot and not self.disable_attn_allreduce:
                 hidden_states = self.lowlat_allreduce(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         # Fully Connected
@@ -952,8 +959,15 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                         eps=self.shared_head.norm.variance_epsilon,
                     ),
                 )
+            else:
+                hidden_states, residual = self.deepseek_allreduce(
+                    hidden_states,
+                    [residual, self.shared_head.norm.weight],
+                    self.shared_head.norm.variance_epsilon,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                )
         else:
-            if iter_use_ll_twoshot:
+            if iter_use_ll_twoshot and not (self.mapping.tp_size == 1 or self.enable_attention_dp):
                 hidden_states = self.lowlat_allreduce(hidden_states)
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
