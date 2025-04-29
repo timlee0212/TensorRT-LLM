@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -465,7 +466,8 @@ class LowLatencyTwoShotAllReduce(nn.Module):
         # Only initialize the buffer when we need to resize it
         self._buffer.fill_(-0.0)
         # CPU barrier since we assume this should not be called in cuda graph
-        torch.ops.trtllm.mcast_gpu_barrier(self._buffer, 600000)
+        torch.cuda.synchronize()
+        mpi_barrier()
 
         self._buffer_ptr = 0
         self._clear_ptr = 2
