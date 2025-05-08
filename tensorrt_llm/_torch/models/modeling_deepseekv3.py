@@ -44,14 +44,8 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import (
-    AllReduce,
-    AllReduceFusionOp,
-    AllReduceParams,
-    LowLatencyTwoShotAllReduce,
-    MoEAllReduce,
-    allgather,
-)
+from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
+                           LowLatencyTwoShotAllReduce, MoEAllReduce, allgather)
 from ..model_config import ModelConfig
 from ..models.modeling_utils import MissingLayer, ModelConfig, support_pp
 from ..modules.attention import MLA
@@ -540,7 +534,9 @@ class Deepseekv3MoE(nn.Module):
             ), f"unmatched tensor shape"
             final_hidden_states = shared_output + routed_output
             if not self.use_dp and self.mapping.tp_size > 1:
-                final_hidden_states = self.allreduce(final_hidden_states, all_reduce_params=final_all_reduce_params)
+                final_hidden_states = self.allreduce(
+                    final_hidden_states,
+                    all_reduce_params=final_all_reduce_params)
 
             return final_hidden_states
 
@@ -710,7 +706,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             **kwargs,
         )
 
-        min_latency_mode = self._enable_latency_mode(hidden_states.size(0)) and (not iter_use_ll_twoshot)
+        min_latency_mode = self._enable_latency_mode(
+            hidden_states.size(0)) and (not iter_use_ll_twoshot)
 
         hidden_states_fp4 = None
         if self.fusion_config.PRE_MOE_FUSION:
@@ -725,14 +722,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, hidden_states_act, hidden_states_sf, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=self.post_attention_layernorm.weight,
                         scale=self.mlp.experts.fc31_input_scale,
                         eps=self.post_attention_layernorm.variance_epsilon,
                     ),
                 )
-                hidden_states_fp4 = Fp4QuantizedTensor(hidden_states_act, hidden_states_sf)
+                hidden_states_fp4 = Fp4QuantizedTensor(hidden_states_act,
+                                                       hidden_states_sf)
             else:
                 hidden_states, residual = self.allreduce(
                     hidden_states,
@@ -761,7 +760,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 act_fp4, act_sf, residual = self.allreduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_QUANT_NVFP4,
                         residual=residual,
                         norm_weight=self.post_attention_layernorm.weight,
                         scale=self.mlp.gate_up_proj.input_scale,
@@ -910,9 +910,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         # deepseek allreduce kernel is better when m < 512
-        iter_use_ll_twoshot = (
-            self.use_lowlat_allreduce and hidden_states.size(0) <= self.lowlat_allreduce.max_num_tokens
-        )
+        iter_use_ll_twoshot = (self.use_lowlat_allreduce
+                               and hidden_states.size(0)
+                               <= self.lowlat_allreduce.max_num_tokens)
         inputs_embeds = self.enorm(embed_tokens(input_ids))
         hidden_states = self.hnorm(hidden_states)
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
@@ -951,13 +951,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                         eps=self.post_attention_layernorm.variance_epsilon,
                     ),
                 )
-            else:
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states,
-                    [residual, self.post_attention_layernorm.weight],
-                    self.post_attention_layernorm.variance_epsilon,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                )
         else:
             if iter_use_ll_twoshot and not self.disable_attn_allreduce:
                 hidden_states = self.lowlat_allreduce(hidden_states)
@@ -989,13 +982,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                         norm_weight=self.shared_head.norm.weight,
                         eps=self.shared_head.norm.variance_epsilon,
                     ),
-                )
-            else:
-                hidden_states, residual = self.deepseek_allreduce(
-                    hidden_states,
-                    [residual, self.shared_head.norm.weight],
-                    self.shared_head.norm.variance_epsilon,
-                    AllReduceFusionOp.RESIDUAL_RMS_NORM,
                 )
         else:
             if iter_use_ll_twoshot and not (self.mapping.tp_size == 1
@@ -1037,16 +1023,6 @@ class DeepseekV3Model(DecoderModel):
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
-        # Need to get the instance of LowLatencyTwoShotAllReduce to clear the buffer at the beginning of the forward
-        mapping = self.model_config.mapping
-        self.use_lowlat_allreduce = (
-            os.environ.get("TRTLLM_LLAR_ENABLED", "0") == "1"
-            and not (mapping.has_pp() or mapping.has_cp())
-            and config.torch_dtype in [torch.bfloat16, torch.float32])
-
-        if self.use_lowlat_allreduce:
-            self.lowlat_allreduce = LowLatencyTwoShotAllReduce(
-                mapping, init_dim=config.hidden_size, dtype=config.torch_dtype)
 
     def forward(
         self,
@@ -1056,11 +1032,6 @@ class DeepseekV3Model(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         pipeline_interface: Optional[PipelineInterface] = None,
     ) -> torch.Tensor:
-
-        if self.use_lowlat_allreduce and torch.cuda.is_current_stream_capturing(
-        ):
-            self.lowlat_allreduce.buf_op_events = torch.cuda.Event()
-            self.lowlat_allreduce.buf_op_events.record()
 
         if self.model_config.mapping.is_first_pp_rank():
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1080,9 +1051,6 @@ class DeepseekV3Model(DecoderModel):
             hidden_states, residual = pipeline_interface
             hidden_states, residual = self.local_layers()[0].input_layernorm(
                 hidden_states, residual)
-
-        if self.use_lowlat_allreduce:
-            self.lowlat_allreduce.clear_buffer()
 
         for decoder_layer in self.local_layers():
             hidden_states, residual = decoder_layer(

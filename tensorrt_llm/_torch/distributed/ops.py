@@ -420,34 +420,11 @@ class LowLatencyTwoShotAllReduce(nn.Module):
         self.is_multi_node = mapping.is_multi_node() or self.force_mn
         self.max_num_tokens = int(os.environ.get("TRTLLM_LLAR_MAX_M", "128"))
 
-        # Separate stream for buffer cleaning
-        self.buf_op_stream = torch.cuda.Stream()
-        self.buf_op_events = None
-
         # Predefined N used to align the allocation
         self.hidden_dim = init_dim
         self.buf_size = self._alloc_buf()
 
         self._initialized = True
-
-    def clear_buffer(self):
-        # Only spawn a different stream if the events is set
-        if self.buf_op_events is not None and torch.cuda.is_current_stream_capturing(
-        ):
-            with torch.cuda.stream(self.buf_op_stream):
-                self.buf_op_events.wait()
-                self._buffer.fill_(-0.0)
-                torch.ops.trtllm.mcast_gpu_barrier(
-                    self._buffer, 600000
-                )  # 600s timeout to accommodate the profiling overhead on one rank
-            torch.cuda.current_stream().wait_stream(self.buf_op_stream)
-            self.buf_op_events = None
-        else:
-            self._buffer.fill_(-0.0)
-            torch.ops.trtllm.mcast_gpu_barrier(
-                self._buffer, 600000
-            )  # 600s timeout to accommodate the profiling overhead on one rank
-        # We need th GPU barrier to make sure the buffer clear is visible to all ranks
 
     def _alloc_buf(self):
         # Triple-buffer, one buffer for the reduce-scatter and one for the allgather, M*N
@@ -469,8 +446,13 @@ class LowLatencyTwoShotAllReduce(nn.Module):
         torch.cuda.synchronize()
         mpi_barrier()
 
-        self._buffer_ptr = 0
-        self._clear_ptr = 2
+        # This is a buffer to maintain the state of this allreduce Op
+        # Should have the same lifetime with self._buffer
+        # [Buffer_ptr, Clear_ptr, Buffer_size, atomic access counter]
+        self._buffer_flags = torch.tensor(
+            [0, 2, self._buffer.size()[3] * self._buffer.size()[2], 0],
+            dtype=torch.uint32,
+            device=self.local_device)
 
         return buffer_tokens * self.hidden_dim
 
@@ -486,13 +468,9 @@ class LowLatencyTwoShotAllReduce(nn.Module):
             shard_out,
             shard_in,
             self._buffer,
-            self._buffer_ptr * buffer_stride,
-            self._clear_ptr * buffer_stride,
+            self._buffer_flags,
             True,
         )
-        self._buffer_ptr = (self._buffer_ptr + 1) % 3
-        self._clear_ptr = (self._clear_ptr + 1) % 3
-
         return shard_out.view(shape)
 
     def all_reduce_res_norm(
@@ -515,17 +493,14 @@ class LowLatencyTwoShotAllReduce(nn.Module):
             shard_out,
             x_flattened,
             self._buffer,
-            self._buffer_ptr * buffer_stride,
-            self._clear_ptr * buffer_stride,
+            self._buffer_flags,
             False,
         )
         if residual_out is None:
             residual_out = torch.empty_like(residual_in)
 
-        torch.ops.trtllm.lowlat_twoshot_rmsnorm(
-            self.tp_rank, residual_out, shard_out,
-            self._buffer[self._buffer_ptr][1], gamma, eps, residual_in)
-        self._buffer_ptr = (self._buffer_ptr + 1) % 3
-        self._clear_ptr = (self._clear_ptr + 1) % 3
+        torch.ops.trtllm.lowlat_twoshot_rmsnorm(residual_out, shard_out,
+                                                self._buffer, gamma, eps,
+                                                residual_in, self._buffer_flags)
 
         return shard_out.view(shape), residual_out.view(shape)

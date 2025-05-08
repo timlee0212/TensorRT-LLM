@@ -27,9 +27,8 @@
 
 namespace tensorrt_llm::kernels
 {
-void mcastGPUBarrier(uint32_t** signal_pads_dev_, int rank, int world_size, int8_t local_device_idx, size_t timeout_ms);
-at::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mcast_mem, at::Tensor output,
-    at::Tensor input, at::Tensor comm_buffer, int64_t buffer_offset, int64_t clear_offset, bool wait_for_results);
-void twoShotRMSNorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor normed_output, torch::Tensor input,
-    torch::Tensor gamma, double epsilon, torch::Tensor residual);
+torch::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mcast_mem, at::Tensor& output,
+    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results);
+void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor& input,
+    torch::Tensor& gamma, double epsilon, torch::Tensor& residual, torch::Tensor& buffer_flags);
 } // namespace tensorrt_llm::kernels

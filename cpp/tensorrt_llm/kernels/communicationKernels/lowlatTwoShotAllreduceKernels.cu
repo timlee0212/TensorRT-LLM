@@ -15,13 +15,14 @@
  */
 
 #include "lowlatTwoShotAllreduceKernels.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/EmptyTensor.h>
-#include <atomic>
 #include <c10/cuda/CUDAGuard.h>
 #include <cstddef>
+#include <cstdint>
 #include <cuda/atomic>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
@@ -64,111 +65,24 @@ inline __device__ __nv_bfloat16 fromFloat<__nv_bfloat16>(float val)
 {
     return __float2bfloat16(val);
 }
-
-// CUDA barrier based on mcast memory, adapted from pytorch symmetric memory implementation
-// Source:
-// https://github.com/pytorch/pytorch/blob/c1f51cf2c4fc8259fa48bc506320118e0e907906/torch/csrc/distributed/c10d/CUDASymmetricMemory.cu#L453
-template <std::memory_order Sem>
-__device__ __forceinline__ uint32_t cas(uint32_t* addr, uint32_t compare, uint32_t val)
-{
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> ref(*addr);
-    ref.compare_exchange_strong(compare, val, cuda::std::memory_order(Sem));
-    return compare;
-}
-
-__device__ __forceinline__ size_t global_timer_ns()
-{
-    size_t val;
-    asm volatile("mov.u64 %0, %globaltimer;" : "=l"(val) : : "memory");
-    return val;
-}
-
-constexpr size_t ns_per_ms = 1e6;
-
-template <std::memory_order Sem>
-__device__ __forceinline__ bool try_put_signal(uint32_t* addr, size_t timeout_ms)
-{
-    size_t deadline = global_timer_ns() + (timeout_ms * ns_per_ms);
-    while (cas<Sem>(addr, 0, 1) != 0)
-    {
-        if (timeout_ms != 0 && global_timer_ns() > deadline)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-template <std::memory_order Sem>
-__device__ __forceinline__ bool try_wait_signal(uint32_t* addr, size_t timeout_ms)
-{
-    size_t deadline = global_timer_ns() + (timeout_ms * ns_per_ms);
-    while (cas<Sem>(addr, 1, 0) != 1)
-    {
-        if (timeout_ms != 0 && global_timer_ns() > deadline)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-static __global__ void barrier_kernel(uint32_t** signal_pads, int channel, int rank, int world_size, size_t timeout_ms)
-{
-    if (threadIdx.x < world_size)
-    {
-        auto target_rank = threadIdx.x;
-        if (target_rank == rank)
-        {
-            return;
-        }
-        auto put_success = try_put_signal<std::memory_order_release>(
-            signal_pads[target_rank] + world_size * channel + rank, timeout_ms);
-        if (!put_success)
-        {
-            printf(
-                "[mcastGPUBarrier] rank %d failed to send signal "
-                "to rank %d on channel %d after %lu microseconds\n",
-                rank, target_rank, channel, timeout_ms);
-            asm volatile("trap;");
-        }
-        auto wait_success = try_wait_signal<std::memory_order_acquire>(
-            signal_pads[rank] + world_size * channel + target_rank, timeout_ms);
-        if (!wait_success)
-        {
-            printf(
-                "[mcastGPUBarrier] rank %d failed to receive signal "
-                "from rank %d on channel %d after %lu microseconds\n",
-                rank, target_rank, channel, timeout_ms);
-            asm volatile("trap;");
-        }
-    }
-}
 } // namespace
 
-void mcastGPUBarrier(uint32_t** signal_pads_dev_, int rank, int world_size, int8_t local_device_idx, size_t timeout_ms)
-{
-    c10::cuda::CUDAGuard guard(local_device_idx);
-    // Supports sync up to 128 ranks; Should be enough for now since the largest NVL domain has 72 GPUs
-    barrier_kernel<<<1, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<uint32_t**>(signal_pads_dev_), 0, rank, world_size, timeout_ms);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 template <int WORLD_SIZE, typename T>
-__global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_ptrs, T* mcast_ptr, size_t input_offset,
-    size_t clear_offset, int num_tokens, int buffer_M, int token_dim, uint32_t** signal_pads, int rank,
-    bool wait_for_results)
+__global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_ptrs, T* mcast_ptr, int num_tokens,
+    int buffer_M, int token_dim, int rank, uint32_t* buffer_flags, bool wait_for_results)
 {
-
     int elt = blockIdx.y * blockDim.x + threadIdx.x;
-
     if (elt >= token_dim)
         return;
-
     int token = blockIdx.x;
 
     cudaGridDependencySynchronize();
+
+    uint32_t* offset_access_ptr = &buffer_flags[3];
+    // Buffer size is M * N, and we need two buffers for reduce-scatter and allgather
+    uint32_t buffer_size = (buffer_flags[2] << 1);
+    uint32_t input_offset = buffer_flags[0] * buffer_size;
+    uint32_t clear_offset = buffer_flags[1] * buffer_size;
 
     if (elt < token_dim)
     {
@@ -232,18 +146,27 @@ __global__ void twoshot_allreduce_kernel(T* output_ptr, T* shard_ptr, T** input_
         // Copy if requested
         if (output_ptr)
             output_ptr[token * token_dim + elt] = val;
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+        {
+            // Make sure all blocks have finished reading the offsets, 2-D grid
+            while (*reinterpret_cast<uint32_t volatile*>(offset_access_ptr) < gridDim.x * gridDim.y)
+            {
+            }
+            buffer_flags[0] = (buffer_flags[0] + 1) % 3;
+            buffer_flags[1] = (buffer_flags[1] + 1) % 3;
+            *(offset_access_ptr) = 0;
+        }
     }
 }
 
 #define LAUNCH_ALL_REDUCE_KERNEL(WORLD_SIZE, T)                                                                        \
     cudaLaunchKernelEx(&config, &twoshot_allreduce_kernel<WORLD_SIZE, T>, reinterpret_cast<T*>(output.data_ptr()),     \
         reinterpret_cast<T*>(input.data_ptr()), reinterpret_cast<T**>(mcast_mem->getBufferPtrsDev()),                  \
-        (T*) mcast_mem->getMulticastPtr(), comm_buffer.storage_offset() + buffer_offset,                               \
-        comm_buffer.storage_offset() + clear_offset, num_tokens, buffer_M, token_dim,                                  \
-        reinterpret_cast<uint32_t**>(mcast_mem->getSignalPadPtrsDev()), mcast_mem->getRank(), wait_for_results);
+        (T*) mcast_mem->getMulticastPtr(), num_tokens, buffer_M, token_dim, mcast_mem->getRank(),                      \
+        reinterpret_cast<uint32_t*>(buffer_flags.data_ptr()), wait_for_results);
 
-at::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mcast_mem, at::Tensor output,
-    at::Tensor input, at::Tensor comm_buffer, int64_t buffer_offset, int64_t clear_offset, bool wait_for_results)
+at::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mcast_mem, at::Tensor& output,
+    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
 {
     TORCH_CHECK(input.is_contiguous(), "two_shot_all_reduce: input must be contiguous.");
     auto world_size = mcast_mem->getWorldSize();
@@ -258,10 +181,8 @@ at::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mc
     dim3 grid(num_tokens, num_blocks);
     TLLM_LOG_DEBUG(
         "[TwoShot AllReduce] twoshot allreduce on rank %d, world_size: %d, buffer_M: %d, num_tokens: %d, token_dim: "
-        "%d, "
-        "buffer_offset: %d, clear_offset: %d, wait_for_results: %d",
-        mcast_mem->getRank(), world_size, buffer_M, num_tokens, token_dim, buffer_offset, clear_offset,
-        wait_for_results);
+        "%d, wait_for_results: %d",
+        mcast_mem->getRank(), world_size, buffer_M, num_tokens, token_dim, wait_for_results);
 
     cudaLaunchConfig_t config;
     cudaLaunchAttribute attrs[1];
@@ -271,7 +192,7 @@ at::Tensor twoShotAllReduceDispatch(tensorrt_llm::runtime::McastDeviceMemory* mc
     config.blockDim = num_threads;
     config.attrs = attrs;
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
     config.numAttrs = 1;
 
     // TODO: Add more instantiations if desired
@@ -375,15 +296,14 @@ inline __device__ float block_reduce_sum(float val)
 }
 
 template <int DIM, int NUM_THREADS, int NUM_INPUTS, typename T_OUT, typename T_IN>
-__global__ void __launch_bounds__(128, 1) RMSNorm(int rank, T_IN* input_plus_residual, T_OUT* output_norm, T_IN* input,
-    T_IN* gamma, float epsilon, T_IN* residual, int batch_size)
+__global__ void __launch_bounds__(128, 1) RMSNorm(T_IN* input_plus_residual, T_OUT* output_norm, T_IN* buffer_input,
+    T_IN* gamma, float epsilon, T_IN* residual, int batch_size, uint32_t* buffer_flags)
 {
 
     static bool const LAMPORT = true;
 
     extern __shared__ uint8_t smem[];
 
-    auto start = clock64();
     int sample = blockIdx.y;
 
     static int const CGA_THREADS = NUM_THREADS * 1;
@@ -401,6 +321,17 @@ __global__ void __launch_bounds__(128, 1) RMSNorm(int rank, T_IN* input_plus_res
     int offsets[NUM_INPUTS][DIM / (1 * ELTS_PER_THREAD * NUM_THREADS)];
 
     cudaTriggerProgrammaticLaunchCompletion();
+
+    uint32_t* offset_access_ptr = &buffer_flags[3];
+    // Buffer size is M * N, and we need two buffers for reduce-scatter and allgather
+    uint32_t buffer_size = buffer_flags[2];
+    uint32_t buffer_offset = buffer_flags[0] * (buffer_size << 1);
+    T_IN* input = &buffer_input[buffer_offset + buffer_size];
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        atomicAdd(offset_access_ptr, 1);
+    }
 
     for (int i = 0; i < NUM_INPUTS; i++)
     {
@@ -428,9 +359,6 @@ __global__ void __launch_bounds__(128, 1) RMSNorm(int rank, T_IN* input_plus_res
     }
 
     __pipeline_commit();
-
-    // This is where we synchronize
-    auto setup_complete = clock64();
 
     // Load all inputs
     bool valid = false;
@@ -463,7 +391,6 @@ __global__ void __launch_bounds__(128, 1) RMSNorm(int rank, T_IN* input_plus_res
         }
     }
 
-    auto loads_issued = clock64();
     __syncthreads();
 
     // Perform the initial input reduction
@@ -494,7 +421,6 @@ __global__ void __launch_bounds__(128, 1) RMSNorm(int rank, T_IN* input_plus_res
         }
     }
 
-    auto loads_complete = clock64();
     // Wait for residual
     __pipeline_wait_prior(1);
     __syncthreads();
@@ -535,13 +461,10 @@ __global__ void __launch_bounds__(128, 1) RMSNorm(int rank, T_IN* input_plus_res
 
     // Wait for Gamma.  There will be a global synchronization as part of the reduction
     __pipeline_wait_prior(0);
-    auto reduce_start = clock64();
 
     float cluster_sum = block_reduce_sum(thread_sum);
 
-    auto reduce_complete = clock64();
-
-    float rcp_rms = rsqrtf(cluster_sum / DIM);
+    float rcp_rms = rsqrtf(cluster_sum / DIM + epsilon);
 
 #pragma unroll
     for (int io = 0; io < ITERS / ELTS_PER_THREAD; io++)
@@ -565,21 +488,29 @@ __global__ void __launch_bounds__(128, 1) RMSNorm(int rank, T_IN* input_plus_res
             + threadIdx.x * ELTS_PER_THREAD]
             = out4;
     }
-
+    // Update the buffer pointers
+    if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+    {
+        // Make sure all blocks have finished accessing the buffer
+        while (*reinterpret_cast<uint32_t volatile*>(offset_access_ptr) != gridDim.x * gridDim.y)
+        {
+        }
+        buffer_flags[0] = (buffer_flags[0] + 1) % 3;
+        buffer_flags[1] = (buffer_flags[1] + 1) % 3;
+        *(offset_access_ptr) = 0;
+    }
     __syncthreads();
-    auto stop = clock64();
 }
 
 template <int H_DIM>
-void _rmsnorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor normed_output, torch::Tensor input,
-    torch::Tensor gamma, double epsilon, torch::Tensor residual)
+void _rmsnorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor& input, torch::Tensor& gamma,
+    double epsilon, torch::Tensor& residual, torch::Tensor& buffer_flags)
 {
 
     // input to rmsnorm is the buffer in the twoshot ar
     // We should use prenorm output to determine the actual used size
     int batch = normed_output.sizes()[0];
     int dim = normed_output.sizes()[1];
-    int _rank{static_cast<int>(rank)};
     float _epsilon{static_cast<float>(epsilon)};
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -600,7 +531,7 @@ void _rmsnorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor normed_o
     config.blockDim = NUM_THREADS;
     config.attrs = attrs;
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
     config.numAttrs = 1;
 
     if (normed_output.scalar_type() == torch::kFloat && input.scalar_type() == torch::kFloat
@@ -610,9 +541,9 @@ void _rmsnorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor normed_o
         cudaFuncSetAttribute(
             &RMSNorm<H_DIM, NUM_THREADS, 1, float, float>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
         config.dynamicSmemBytes = shmem_size;
-        cudaLaunchKernelEx(&config, &RMSNorm<H_DIM, NUM_THREADS, 1, float, float>, _rank,
-            prenorm_output.data_ptr<float>(), normed_output.data_ptr<float>(), input.data_ptr<float>(),
-            gamma.data_ptr<float>(), _epsilon, residual.data_ptr<float>(), batch);
+        cudaLaunchKernelEx(&config, &RMSNorm<H_DIM, NUM_THREADS, 1, float, float>, prenorm_output.data_ptr<float>(),
+            normed_output.data_ptr<float>(), input.data_ptr<float>(), gamma.data_ptr<float>(), _epsilon,
+            residual.data_ptr<float>(), batch, buffer_flags.data_ptr<uint32_t>());
     }
     else if (normed_output.scalar_type() == torch::kBFloat16 && input.scalar_type() == torch::kBFloat16
         && gamma.scalar_type() == torch::kBFloat16)
@@ -621,11 +552,11 @@ void _rmsnorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor normed_o
         cudaFuncSetAttribute(&RMSNorm<H_DIM, NUM_THREADS, 1, __nv_bfloat16, __nv_bfloat16>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
         config.dynamicSmemBytes = shmem_size;
-        cudaLaunchKernelEx(&config, &RMSNorm<H_DIM, NUM_THREADS, 1, __nv_bfloat16, __nv_bfloat16>, _rank,
+        cudaLaunchKernelEx(&config, &RMSNorm<H_DIM, NUM_THREADS, 1, __nv_bfloat16, __nv_bfloat16>,
             (__nv_bfloat16*) prenorm_output.data_ptr<at::BFloat16>(),
             (__nv_bfloat16*) normed_output.data_ptr<at::BFloat16>(), (__nv_bfloat16*) input.data_ptr<at::BFloat16>(),
             (__nv_bfloat16*) gamma.data_ptr<at::BFloat16>(), _epsilon,
-            (__nv_bfloat16*) residual.data_ptr<at::BFloat16>(), batch);
+            (__nv_bfloat16*) residual.data_ptr<at::BFloat16>(), batch, buffer_flags.data_ptr<uint32_t>());
     }
     else
     {
@@ -635,20 +566,20 @@ void _rmsnorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor normed_o
 }
 } // namespace
 
-void twoShotRMSNorm(int64_t rank, torch::Tensor prenorm_output, torch::Tensor normed_output, torch::Tensor input,
-    torch::Tensor gamma, double epsilon, torch::Tensor residual)
+void twoShotRMSNorm(torch::Tensor& prenorm_output, torch::Tensor& normed_output, torch::Tensor& input,
+    torch::Tensor& gamma, double epsilon, torch::Tensor& residual, torch::Tensor& buffer_flags)
 {
     int dim = normed_output.sizes()[1];
     switch (dim)
     {
-    case 2048: _rmsnorm<2048>(rank, prenorm_output, normed_output, input, gamma, epsilon, residual); break;
-    case 4096: _rmsnorm<4096>(rank, prenorm_output, normed_output, input, gamma, epsilon, residual); break;
+    case 2048: _rmsnorm<2048>(prenorm_output, normed_output, input, gamma, epsilon, residual, buffer_flags); break;
+    case 4096: _rmsnorm<4096>(prenorm_output, normed_output, input, gamma, epsilon, residual, buffer_flags); break;
     // Llama-4 Hidden Dimension
-    case 5120: _rmsnorm<5120>(rank, prenorm_output, normed_output, input, gamma, epsilon, residual); break;
+    case 5120: _rmsnorm<5120>(prenorm_output, normed_output, input, gamma, epsilon, residual, buffer_flags); break;
     // DeepSeek Hidden Dimension
-    case 7168: _rmsnorm<7168>(rank, prenorm_output, normed_output, input, gamma, epsilon, residual); break;
-    case 8192: _rmsnorm<8192>(rank, prenorm_output, normed_output, input, gamma, epsilon, residual); break;
+    case 7168: _rmsnorm<7168>(prenorm_output, normed_output, input, gamma, epsilon, residual, buffer_flags); break;
+    case 8192: _rmsnorm<8192>(prenorm_output, normed_output, input, gamma, epsilon, residual, buffer_flags); break;
     default: TORCH_CHECK(false, "Unsupported dimension for rmsnorm: ", dim);
     }
 }
-}; // namespace tensorrt_llm::kernels
+} // namespace tensorrt_llm::kernels
