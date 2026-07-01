@@ -138,6 +138,41 @@ def fp4_quantize(input: torch.Tensor, scale: torch.Tensor):
     return torch.ops.trtllm.fp4_quantize(input, scale, 16, False)
 
 
+# Sentinel a worker returns when strategy=MNNVL was requested but the MNNVL
+# backend failed to initialize (e.g. NVLS / NVSwitch multicast unavailable
+# because the NVLink fabric/IMEX plane is not provisioned on the node). In that
+# case AllReduce silently falls back to the generic allreduce path, so the MNNVL
+# kernels under test are never exercised. The parent turns this into a
+# pytest.skip instead of letting the fallback masquerade as a pass or surface as
+# a misleading failure (e.g. a different rejection message).
+MNNVL_UNAVAILABLE = "__mnnvl_unavailable__"
+
+
+class _MnnvlBackendUnavailable(Exception):
+    """Raised inside a worker when strategy=MNNVL fell back to the generic path."""
+
+
+def mnnvl_backend_unavailable(allreduce: AllReduce) -> bool:
+    """Whether an AllReduce built with strategy=MNNVL fell back to the generic
+    path because the MNNVL backend could not initialize on this system."""
+    return (allreduce.strategy == AllReduceStrategy.MNNVL
+            and allreduce.mnnvl_allreduce is None)
+
+
+def check_mnnvl_results_or_skip(results):
+    """Collect worker results; skip if any rank reported that the MNNVL backend
+    was unavailable, otherwise assert that every rank succeeded."""
+    results = list(results)
+    if any(r == MNNVL_UNAVAILABLE for r in results):
+        pytest.skip(
+            "MNNVL/NVLS backend unavailable on this system (NVLink fabric/IMEX "
+            "plane not provisioned); strategy=MNNVL silently fell back to the "
+            "generic allreduce path, so the MNNVL kernels under test were not "
+            "exercised.")
+    for r in results:
+        assert r is True
+
+
 def run_single_rank(
     tensor_parallel_size,
     single_rank_forward_func,
@@ -169,6 +204,8 @@ def run_single_rank(
             strategy,
             max_userbuffers_size,
         )
+    except _MnnvlBackendUnavailable:
+        return MNNVL_UNAVAILABLE
     except Exception:
         traceback.print_exc()
         raise
@@ -194,6 +231,8 @@ def run_quant_single_rank(
         single_rank_forward_func(input, residual, norm_weight, scale, eps,
                                  dtype, tensor_parallel_size, rank, fusion_op,
                                  reference_norm, reference_residual)
+    except _MnnvlBackendUnavailable:
+        return MNNVL_UNAVAILABLE
     except Exception:
         traceback.print_exc()
         raise
@@ -207,6 +246,8 @@ def run_reject_single_rank(tensor_parallel_size, single_rank_forward_func,
     try:
         single_rank_forward_func(input, residual, norm_weight, scale,
                                  tensor_parallel_size, rank)
+    except _MnnvlBackendUnavailable:
+        return MNNVL_UNAVAILABLE
     except Exception:
         traceback.print_exc()
         raise
@@ -246,6 +287,8 @@ def mnnvl_quant_fusion_forward(
         strategy=AllReduceStrategy.MNNVL,
         dtype=dtype,
     )
+    if mnnvl_backend_unavailable(allreduce):
+        raise _MnnvlBackendUnavailable()
 
     output = allreduce(
         input,
@@ -322,6 +365,8 @@ def mnnvl_nvfp4_reject_fp32_forward(
         strategy=AllReduceStrategy.MNNVL,
         dtype=torch.float32,
     )
+    if mnnvl_backend_unavailable(allreduce):
+        raise _MnnvlBackendUnavailable()
 
     with pytest.raises(RuntimeError,
                        match="NVFP4 quantization requires FP16 or BF16"):
@@ -384,6 +429,8 @@ def row_linear_residual_norm_fusion_forward(
         strategy=strategy,
         dtype=dtype,
     )
+    if mnnvl_backend_unavailable(allreduce):
+        raise _MnnvlBackendUnavailable()
 
     # Since all the modules here are provided by TRT-LLM,
     # so it has to be fullgraph compatible
@@ -482,8 +529,7 @@ def _run_row_linear_residual_norm_fusion(seq_len,
             ) for i in range(tensor_parallel_size)
         ]),
     )
-    for r in results:
-        assert r is True
+    check_mnnvl_results_or_skip(results)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
@@ -547,8 +593,7 @@ def test_mnnvl_quant_fusion(seq_len, hidden_size, dtype, fusion_op,
             reference_residual,
         ) for i in range(tensor_parallel_size)]),
     )
-    for r in results:
-        assert r is True
+    check_mnnvl_results_or_skip(results)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
@@ -577,8 +622,7 @@ def test_mnnvl_nvfp4_rejects_fp32_before_launch(mpi_pool_executor):
             scale,
         ) for i in range(tensor_parallel_size)]),
     )
-    for r in results:
-        assert r is True
+    check_mnnvl_results_or_skip(results)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
